@@ -1,0 +1,150 @@
+import pandas as pd
+# --- BẮT ĐẦU PHẦN SPARK ---
+# 1. Khởi tạo SparkSession
+# PHẢI KHỞI TẠO TRƯỚC KHI SỬ DỤNG BIẾN 'spark'
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import regexp_replace, col, expr
+from pyspark.sql.types import IntegerType
+from pyspark.ml.feature import Tokenizer, StopWordsRemover, HashingTF, IDF
+from pyspark.ml import Pipeline, PipelineModel
+from pyspark.ml.classification import MultilayerPerceptronClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator # Để đánh giá
+import os
+import shutil
+
+# Khởi tạo Spark Session
+spark = SparkSession.builder.appName("TextClassification").getOrCreate()
+print("\nSparkSession đã được khởi tạo.")
+
+# --- Định nghĩa hàm đánh giá mô hình ---
+# ĐỊNH NGHĨA HÀM TRƯỚC KHI GỌI NÓ
+def evaluate_model(predictions, model_name):
+    print(f"\n📊 Đánh giá mô hình: {model_name}")
+    # Evaluator sử dụng label_ml và prediction
+    acc_eval = MulticlassClassificationEvaluator(labelCol="label_ml", predictionCol="prediction", metricName="accuracy")
+    f1_eval = MulticlassClassificationEvaluator(labelCol="label_ml", predictionCol="prediction", metricName="f1")
+    prec_eval = MulticlassClassificationEvaluator(labelCol="label_ml", predictionCol="prediction", metricName="weightedPrecision")
+    rec_eval = MulticlassClassificationEvaluator(labelCol="label_ml", predictionCol="prediction", metricName="weightedRecall")
+
+    print(f"✅ Accuracy:  {acc_eval.evaluate(predictions):.4f}")
+    print(f"🎯 F1-score:  {f1_eval.evaluate(predictions):.4f}")
+    print(f"🔍 Precision: {prec_eval.evaluate(predictions):.4f}")
+    print(f"🔁 Recall:    {rec_eval.evaluate(predictions):.4f}")
+
+
+# 2. Chuyển từ Pandas DataFrame (df) sang Spark DataFrame
+# Đảm bảo biến 'df' (Pandas DataFrame) đã được tạo từ các bước đọc dữ liệu ở trên
+try:
+    df_spark = spark.createDataFrame(df)
+    print("Đã chuyển Pandas DataFrame sang Spark DataFrame.")
+except NameError:
+    print("Lỗi: Pandas DataFrame 'df' chưa được định nghĩa. Vui lòng chạy các ô đọc dữ liệu trước.")
+    # Dừng thực thi nếu df chưa tồn tại
+    # raise NameError("Pandas DataFrame 'df' is not defined")
+except Exception as e:
+    print(f"Lỗi khi chuyển Pandas DataFrame sang Spark DataFrame: {e}")
+
+
+# --- Các bước chuẩn bị dữ liệu ban đầu trên Spark DataFrame ---
+# Đảm bảo df_spark có cột 'content' và 'label'
+df_spark = df_spark.withColumn("content_clean", regexp_replace("content", "[\\r\\n]+", " "))
+
+# Ép kiểu label từ CSV thành số nguyên (nếu cần, đảm bảo cột 'label' tồn tại và có giá trị số)
+# Dựa trên code của bạn, cột 'label' đã có từ dữ liệu ES hoặc temp.csv
+# Đảm bảo rằng cột 'label' này chứa các giá trị số nguyên (-1, 0, 1)
+# Nếu cột label từ CSV là string, bạn cần ánh xạ nó sang số trước khi cast
+df_spark = df_spark.withColumn("rating", col("label").cast(IntegerType()))
+
+# Tạo label dương: label = rating + 1 (để phù hợp yêu cầu mô hình Spark ML - nhãn phải là số nguyên không âm 0, 1, 2...)
+df_spark = df_spark.withColumn("label_ml", expr("rating + 1")) # Sử dụng label_ml cho mô hình Spark ML
+
+# Loại bỏ các dòng có rating null sau khi cast
+df_spark = df_spark.filter(col("rating").isNotNull())
+
+print("Đã chuẩn bị dữ liệu trên Spark DataFrame.")
+df_spark.printSchema()
+print(f"Số dòng sau khi chuẩn bị: {df_spark.count()}")
+
+
+# --- Các bước tiền xử lý văn bản ---
+# INPUT: content_clean
+# OUTPUT: features
+tokenizer = Tokenizer(inputCol="content_clean", outputCol="words")
+remover = StopWordsRemover(inputCol="words", outputCol="filtered")
+# Sử dụng numFeatures=1000 để khớp với input_dim của MLP
+hashingTF = HashingTF(inputCol="filtered", outputCol="rawFeatures", numFeatures=1000)
+idf = IDF(inputCol="rawFeatures", outputCol="features")
+
+# --- Mô hình MLP ---
+# INPUT: features
+# OUTPUT: prediction, probability, rawPrediction
+# Số chiều đặc trưng đầu vào phải khớp với numFeatures của HashingTF
+input_dim = 1000 # <-- KHỚP VỚI HashingTF numFeatures
+# Cấu trúc mạng: [input, hidden1, hidden2, ..., output]
+# Số lớp output phải khớp với số lượng nhãn (3 lớp: 0, 1, 2)
+layers = [input_dim, 64, 32, 3]
+
+mlp = MultilayerPerceptronClassifier(
+    featuresCol="features", # Đầu vào là cột 'features' từ IDF
+    labelCol="label_ml", # Nhãn là cột 'label_ml' (0, 1, 2) cho mô hình Spark ML
+    maxIter=100,
+    layers=layers,
+    blockSize=128,
+    seed=42
+)
+
+# --- Xây dựng Pipeline HOÀN CHỈNH ---
+# Kết hợp TẤT CẢ các bước tiền xử lý và mô hình ML thành một Pipeline DUY NHẤT
+# Thứ tự các stages rất quan trọng: Tokenizer -> Remover -> HashingTF -> IDF -> MLP
+full_pipeline = Pipeline(stages=[tokenizer, remover, hashingTF, idf, mlp])
+
+print("\nĐã xây dựng Pipeline ML hoàn chỉnh (Tiền xử lý + Mô hình).")
+
+# --- Chia train/test ---
+# Chia dữ liệu sau khi đã làm sạch ban đầu và tạo label_ml
+train_data, test_data = df_spark.randomSplit([0.8, 0.2], seed=42)
+
+print(f"Dữ liệu đã chia: Train={train_data.count()} dòng, Test={test_data.count()} dòng")
+
+# --- Huấn luyện Pipeline HOÀN CHỈNH trên dữ liệu huấn luyện ---
+# Pipeline sẽ tự động chạy các bước tiền xử lý và huấn luyện mô hình MLP
+print("\nBắt đầu huấn luyện Pipeline ML hoàn chỉnh...")
+# Lỗi Py4J thường xảy ra ở bước fit() này do tài nguyên hoặc môi trường Colab
+full_pipeline_model = full_pipeline.fit(train_data)
+
+print("Pipeline ML hoàn chỉnh đã được huấn luyện.")
+
+# --- (Tùy chọn) Đánh giá Pipeline đã huấn luyện trên test_data ---
+# Áp dụng toàn bộ Pipeline lên test_data để dự đoán
+test_predictions = full_pipeline_model.transform(test_data)
+
+# Chuyển prediction về lại rating gốc (-1, 0, 1)
+# Cột 'prediction' được tạo ra bởi mô hình phân loại trong Pipeline
+test_predictions = test_predictions.withColumn("ml_predicted_rating", col("prediction") - 1)
+
+print("\nKết quả dự đoán trên Test Data bằng Pipeline đã huấn luyện:")
+# Hiển thị các cột quan trọng: nội dung gốc, rating gốc, rating dự đoán, label dự đoán ML, xác suất
+test_predictions.select("content", "rating", "ml_predicted_rating", "prediction", "probability").show(truncate=60)
+
+# Đánh giá mô hình (sử dụng label_ml và prediction)
+# Hàm evaluate_model đã được định nghĩa ở trên
+evaluate_model(test_predictions, "Full ML Pipeline (DNN)")
+
+
+# --- Lưu Pipeline Model đã huấn luyện ---
+# Lưu toàn bộ Pipeline Model ra một thư mục
+# Thay thế đường dẫn dưới đây bằng đường dẫn bạn muốn lưu trong môi trường Colab
+SAVE_PATH_COLAB = "/content/spark_full_ml_pipeline_model" # <-- ĐƯỜNG DẪN LƯU TRONG COLAB
+
+try:
+    # Xóa thư mục cũ nếu tồn tại
+    if os.path.exists(SAVE_PATH_COLAB):
+        shutil.rmtree(SAVE_PATH_COLAB)
+        print(f"Đã xóa thư mục mô hình cũ tại {SAVE_PATH_COLAB}")
+
+    full_pipeline_model.save(SAVE_PATH_COLAB)
+    print(f"Pipeline ML hoàn chỉnh đã được lưu thành công tại: {SAVE_PATH_COLAB}")
+
+except Exception as e:
+    print(f"Lỗi khi lưu Pipeline ML: {e}")
+    print(f"Vui lòng kiểm tra quyền ghi vào thư mục {SAVE_PATH_COLAB} trong Colab.")
