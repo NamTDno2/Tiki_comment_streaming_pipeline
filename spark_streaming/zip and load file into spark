@@ -1,0 +1,35 @@
+import zipfile
+import os
+
+# Đường dẫn đến thư mục mô hình đã lưu trong Colab
+MODEL_DIR_IN_COLAB = "/content/spark_full_ml_pipeline_model" # <-- Đảm bảo đường dẫn này chính xác
+
+# Tên file zip sẽ tạo ra
+ZIP_FILE_NAME = "spark_full_ml_pipeline_model.zip"
+
+print(f"Đang nén thư mục '{MODEL_DIR_IN_COLAB}' thành file '{ZIP_FILE_NAME}'...")
+
+try:
+    # Tạo đối tượng ZipFile
+    with zipfile.ZipFile(ZIP_FILE_NAME, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Duyệt qua tất cả các file và thư mục con trong thư mục mô hình
+        for root, dirs, files in os.walk(MODEL_DIR_IN_COLAB):
+            # Thêm thư mục vào zip (đảm bảo giữ cấu trúc thư mục)
+            for dir in dirs:
+                # Tạo đường dẫn tương đối để giữ cấu trúc thư mục bên trong zip
+                relative_path = os.path.relpath(os.path.join(root, dir), MODEL_DIR_IN_COLAB)
+                zipf.write(os.path.join(root, dir), arcname=relative_path)
+
+            # Thêm file vào zip
+            for file in files:
+                 # Tạo đường dẫn tương đối
+                relative_path = os.path.relpath(os.path.join(root, file), MODEL_DIR_IN_COLAB)
+                zipf.write(os.path.join(root, file), arcname=relative_path)
+
+    print(f"Đã tạo file zip thành công: {ZIP_FILE_NAME}")
+
+except FileNotFoundError:
+    print(f"Lỗi: Thư mục mô hình '{MODEL_DIR_IN_LAB}' không tồn tại.")
+except Exception as e:
+    print(f"Lỗi khi tạo file zip: {e}")
+
