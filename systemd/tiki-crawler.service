@@ -1,1 +1,15 @@
+[Unit]
+Description=Tiki Comment Crawler Service
+After=network.target kafka.service zookeeper.service
 
+[Service]
+User=nam0837305039
+WorkingDirectory=/home/nam0837305039/tiki-crawler/
+ExecStart=/usr/bin/python3 /home/nam0837305039/tiki-crawler/crawl_comment.py
+Environment="PYTHONUNBUFFERED=1"
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
